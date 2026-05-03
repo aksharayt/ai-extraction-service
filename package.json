@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "@ngrx/effects": "^15.4.0",
+    "@ngrx/entity": "^15.4.0",
+    "@ngrx/store": "^15.4.0",
+    "@ngrx/store-devtools": "^15.4.0",
+    "chart.js": "^4.2.1",
+    "date-fns": "^4.1.0",
+    "ng2-charts": "^4.1.1"
+  }
+}
