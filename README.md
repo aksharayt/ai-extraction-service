@@ -1,21 +1,30 @@
-SECTION A — Architecture & Design Rationale
-The AI Extraction Service is introduced as a fourth microservice, sitting between the Document Service and the Underwriting Service. It is not embedded into either existing service because extraction is a distinct, independently deployable concern with its own failure modes, latency profile, and compliance surface area. This separation preserves the existing service boundaries and respects the constraint that the Underwriting Service API cannot be modified.
-Data flow: A loan officer uploads a document through the Angular dashboard. The Document Service stores the file in S3 and writes metadata to PostgreSQL. The officer then triggers extraction — the Angular frontend calls the Extraction Service's POST /api/v1/extractions/trigger endpoint with the application ID and document ID. The Extraction Service fetches the raw text from the document, runs it through the PII Redaction Service, calls the Claude API with the redacted text, parses the structured JSON response, runs a discrepancy analysis against the applicant's self-reported figures, persists the result with status PENDING_REVIEW, and returns it to the dashboard. The loan officer reviews, can edit any field, adds notes, and submits an approval decision. Only after the status reaches APPROVED or EDITED_AND_APPROVED can the Underwriting packet endpoint be called — this enforces the human-in-the-loop requirement at the API level, not just the UI level.
-Key design decisions:
-The PII redaction is performed entirely within the trust boundary before any data crosses to an external API. Regex-based redaction handles SSNs, account numbers, routing numbers, addresses, and employee names in specific document sections. The trade-off is that regex cannot catch every PII pattern — a second sprint would integrate AWS Comprehend's PII entity detection for higher recall. However, regex provides deterministic, auditable, zero-latency protection that does not itself call an external API.
-For the LLM call, I chose a structured JSON-only system prompt rather than free-form extraction. This constrains the model's output to a parseable schema and makes hallucination failures detectable — if the response is not valid JSON, the extraction is marked failed and the loan officer is notified rather than silently receiving corrupt data.
-Alternatives considered: AWS Textract was evaluated as an alternative to Claude for extraction. Textract provides high accuracy for structured forms but is weaker on semi-structured or non-standard pay stub layouts. Claude's instruction-following capability handles layout variation better. A hybrid approach — Textract for layout analysis, Claude for semantic extraction — is the recommended second-sprint enhancement.
+# AI-Powered Income Document Extraction Service
 
-SECTION B — Production Readiness
-B1: Path to Production
-Error handling for LLM failures uses Spring Retry with exponential backoff (3 attempts, 2x multiplier). After exhausted retries, the extraction record is marked EXTRACTION_FAILED and the loan officer is notified — the application does not stall silently. Hallucination detection is enforced by schema validation: if any extracted monetary value is negative, if the confidence score drops below 0.70, or if pay period dates are logically invalid (end before start), the record is auto-flagged with NEEDS_CLARIFICATION rather than PENDING_REVIEW, requiring explicit officer acknowledgment before any downstream flow.
-Monitoring uses Spring Actuator with a Prometheus endpoint at /actuator/prometheus. Key metrics to alert on: LLM API latency p99, discrepancy flag rate per day (a sudden spike suggests a new pay stub format confusing the model), extraction failure rate, and officer review turnaround time. These feed a Grafana dashboard alongside the existing ECS and RDS metrics.
-Security hardening for production: the Anthropic API key is stored in AWS Secrets Manager and injected at ECS task start — never in environment variables directly. The extraction endpoint requires the LOAN_OFFICER or ADMIN role via JWT claims. The raw document text is never logged — only the document ID and redaction count appear in logs. All inter-service calls inside the VPC use IAM roles, not shared secrets.
-Rollback strategy: if the AI extraction produces bad results at scale, a feature flag in the application config disables the /trigger endpoint and reverts loan officers to the existing manual data entry flow. No data migration is needed because the Underwriting packet format is identical whether data was entered manually or AI-assisted — the incomeVerificationMethod field records the distinction for audit purposes.
-B2: Where AI Coding Assistants Go Wrong (answered without AI assistance)
-The most dangerous scenario in this codebase is an AI coding assistant generating the PII redaction patterns. A plausible but incorrect answer would be a regex for SSN detection that uses \d{9} instead of \d{3}-\d{2}-\d{4}. Both match nine digits, but the unformatted version would trigger on zip+4 codes, phone numbers, EINs, and account numbers — generating false positives that silently corrupt business logic — while also missing the actual formatted SSN if it appears with dashes. The generated code would compile, tests using "123-45-6789" as a fixture would pass, and the error would only surface in production against real documents that contain EINs in the format XX-XXXXXXX. To catch this before merging: I would run the regex against a fixture file containing SSNs, EINs, zip+4 codes, phone numbers, and account numbers simultaneously and assert which tokens should and should not match. An AI assistant does not run this fixture test — it generates the pattern from the description "match a Social Security number" and stops.
+## Overview
+This repository introduces an **AI Extraction Service** designed to assist loan officers by extracting and validating income data from uploaded documents (e.g., pay stubs). The service integrates cleanly into an existing microservices architecture without modifying the Underwriting Service API, while enforcing a **human-in-the-loop** workflow for compliance and auditability.
 
-SECTION C — AI Usage Log
-Interaction 1: Asked Claude to draft the initial structure of the LLM system prompt for pay stub extraction. It produced a prompt asking for a bulleted list response. I changed this to a strict JSON-only schema with explicit null handling, because a bulleted list is unparseable in production and creates a brittle string-parsing dependency.
-Interaction 2: Asked an AI assistant to generate the Spring Security configuration. It produced a configuration that used antMatchers() (deprecated in Spring Boot 3.x) instead of requestMatchers(). I caught this by checking the Spring Boot 3.x migration guide, which explicitly calls out this deprecation. The code would have compiled with a warning but failed at runtime on strict configurations.
-Interaction 3: Asked Claude to generate the discrepancy analysis logic. It used a flat percentage threshold without considering the direction of the discrepancy (income higher vs. lower than reported). I kept the threshold logic but added the directional note in the discrepancyNotes field, because a loan officer treating a $450 over-report differently from a $450 under-report is a compliance-relevant distinction.
+---
+
+## Architecture & Design Rationale
+
+### Service Placement
+The **AI Extraction Service** is implemented as a **fourth microservice**, positioned between:
+- **Document Service**
+- **Underwriting Service**
+
+It is intentionally **not embedded** into either service because:
+- Extraction is a distinct concern with its own latency, failure modes, and compliance risks
+- It must be independently deployable and feature-flagged
+- The Underwriting Service API is immutable by constraint
+
+This preserves service boundaries and prevents AI-related instability from impacting core underwriting flows.
+
+---
+
+### End-to-End Data Flow
+1. A loan officer uploads a document via the Angular dashboard  
+2. **Document Service**
+   - Stores the file in S3
+   - Persists metadata in PostgreSQL  
+3. Loan officer triggers extraction  
+4. Angular frontend calls  
